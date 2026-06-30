@@ -16,6 +16,10 @@
 #include <bcl.h>
 #include <twr.h>
 
+#define SEKUND                              1000
+#define MINUT                               (60 * SEKUND)
+#define HODIN                               (60 * MINUT)
+
 typedef struct
 {
     uint8_t channel;

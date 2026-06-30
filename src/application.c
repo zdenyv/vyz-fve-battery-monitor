@@ -1,8 +1,128 @@
 #include <application.h>
+#include <twr_eeprom.h>
 
-#define VYZ_VERSION "1.0"
-#define THERMOSTAT_SET_POINT 15.0
+#define VYZ_VERSION "1.2"
+
+#define THERMOSTAT_SET_POINT_DEFAULT 10.0f
+#define THERMOSTAT_SET_POINT_MIN     2.0f
+#define THERMOSTAT_SET_POINT_MAX     25.0f
+
+#define EEPROM_ADDR_SETPOINT 0x0000
+#define EEPROM_MAGIC         0xC0FFEE01UL
+
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    float    set_point;
+} setpoint_blob_t;
+
+static float thermostat_set_point = THERMOSTAT_SET_POINT_DEFAULT;
 static bool heating = false;
+
+static void thermostat_set_point_load(void)
+{
+    setpoint_blob_t b;
+    if (twr_eeprom_read(EEPROM_ADDR_SETPOINT, &b, sizeof(b))
+        && b.magic == EEPROM_MAGIC
+        && b.set_point >= THERMOSTAT_SET_POINT_MIN
+        && b.set_point <= THERMOSTAT_SET_POINT_MAX)
+    {
+        thermostat_set_point = b.set_point;
+    }
+}
+
+static void thermostat_set_point_save(float v)
+{
+    if (v < THERMOSTAT_SET_POINT_MIN) v = THERMOSTAT_SET_POINT_MIN;
+    if (v > THERMOSTAT_SET_POINT_MAX) v = THERMOSTAT_SET_POINT_MAX;
+
+    if (fabsf(v - thermostat_set_point) < 0.01f) return;  // šetří wear
+
+    setpoint_blob_t b = { .magic = EEPROM_MAGIC, .set_point = v };
+    twr_eeprom_write(EEPROM_ADDR_SETPOINT, &b, sizeof(b));
+    thermostat_set_point = v;
+}
+
+/*
+ ============================================================================
+  VENTILÁTOR GARÁŽE  (chlazení, nezávislé na termostatu topení baterie)
+ ----------------------------------------------------------------------------
+  - Akční člen: 5V relé deska na Sensor Module kanál C = GPIO P7
+  - Teplota:    EXTERNÍ DS18B20 v garáži (ne onboard Climate Module!)
+                device 0x3200000ceb33a428, topic ext-thermometer/.../temperature
+  - Logika:     CHLAZENÍ s hysterezí. ON při t >= práh, OFF při t <= práh - hyst.
+  - Dálkově:    jen nastavení prahu (vent/-/set-point/set), stav se publikuje.
+ ============================================================================
+*/
+
+// Cílové externí čidlo (garáž). Pojistka, kdyby přibyl další DS18B20.
+#define VENT_SENSOR_ADDRESS  0x3200000ceb33a428ULL
+
+// Relé deska na P7. Pokud je deska active-LOW (sepne logickou 0),
+// přepni VENT_RELAY_ACTIVE_HIGH na 0.
+#define VENT_RELAY_GPIO          TWR_GPIO_P7
+#define VENT_RELAY_ACTIVE_HIGH   1
+#define VENT_RELAY_ON_LEVEL      (VENT_RELAY_ACTIVE_HIGH ? 1 : 0)
+#define VENT_RELAY_OFF_LEVEL     (VENT_RELAY_ACTIVE_HIGH ? 0 : 1)
+
+#define VENT_SET_POINT_DEFAULT   30.0f   // °C – ON nad tuto teplotu
+#define VENT_SET_POINT_MIN       20.0f
+#define VENT_SET_POINT_MAX       45.0f
+#define VENT_HYSTERESIS          3.0f    // OFF při (práh - 3 °C), tj. 27 °C default
+
+#define EEPROM_ADDR_VENT_SETPOINT 0x0010 // mimo blok topení (0x0000)
+
+static float vent_set_point = VENT_SET_POINT_DEFAULT;
+static bool  vent_on = false;
+
+static void vent_set_point_load(void)
+{
+    setpoint_blob_t b;
+    if (twr_eeprom_read(EEPROM_ADDR_VENT_SETPOINT, &b, sizeof(b))
+        && b.magic == EEPROM_MAGIC
+        && b.set_point >= VENT_SET_POINT_MIN
+        && b.set_point <= VENT_SET_POINT_MAX)
+    {
+        vent_set_point = b.set_point;
+    }
+}
+
+static void vent_set_point_save(float v)
+{
+    if (v < VENT_SET_POINT_MIN) v = VENT_SET_POINT_MIN;
+    if (v > VENT_SET_POINT_MAX) v = VENT_SET_POINT_MAX;
+
+    if (fabsf(v - vent_set_point) < 0.01f) return;  // šetří EEPROM wear
+
+    setpoint_blob_t b = { .magic = EEPROM_MAGIC, .set_point = v };
+    twr_eeprom_write(EEPROM_ADDR_VENT_SETPOINT, &b, sizeof(b));
+    vent_set_point = v;
+}
+
+// Fyzicky nastaví relé + publikuje stav jen při změně (pro graf spínání).
+static void vent_relay_set(bool on)
+{
+    if (on == vent_on) return;
+
+    twr_gpio_set_output(VENT_RELAY_GPIO, on ? VENT_RELAY_ON_LEVEL : VENT_RELAY_OFF_LEVEL);
+    vent_on = on;
+    twr_radio_pub_bool("vent/-/state", &vent_on);
+    twr_log_debug("Ventilator garaz: %s (prah %.1f C)", on ? "ON" : "OFF", (double) vent_set_point);
+}
+
+// Rozhodovací logika chlazení s hysterezí. Volá se z DS18B20 handleru.
+static void vent_control(float t)
+{
+    if (isnan(t)) return;
+
+    if (!vent_on && t >= vent_set_point)
+    {
+        vent_relay_set(true);
+    }
+    else if (vent_on && t <= (vent_set_point - VENT_HYSTERESIS))
+    {
+        vent_relay_set(false);
+    }
+}
 
 /*
  SENSOR MODULE CONNECTION
@@ -19,27 +139,27 @@ GND - black
 DATA- yellow (white)
 */
 
-#define TEMPERATURE_PUB_NO_CHANGE_INTEVAL (15 * 60 * 1000)
+#define TEMPERATURE_PUB_NO_CHANGE_INTEVAL (1 * MINUT)
 #define TEMPERATURE_PUB_VALUE_CHANGE 0.2f
-#define TEMPERATURE_UPDATE_INTERVAL (10 * 1000)
+#define TEMPERATURE_UPDATE_INTERVAL (10 * SEKUND)
 
-#define HYGROMETER_UPDATE_INTERVAL (1 * 60 * 1000)
-#define LUX_UPDATE_INTERVAL        (1 * 1000)
-#define BAROMETER_UPDATE_INTERVAL  (1 * 60 * 1000)
+#define HYGROMETER_UPDATE_INTERVAL (1 * MINUT)
+#define LUX_UPDATE_INTERVAL        (1 * SEKUND)
+#define BAROMETER_UPDATE_INTERVAL  (1 * MINUT)
 
-#define TEMPERATURE_TAG_PUB_NO_CHANGE_INTEVAL (15 * 60 * 1000)
+#define TEMPERATURE_TAG_PUB_NO_CHANGE_INTEVAL (1 * MINUT)
 #define TEMPERATURE_TAG_PUB_VALUE_CHANGE 0.2f
 
-#define HUMIDITY_TAG_PUB_NO_CHANGE_INTEVAL (15 * 60 * 1000)
+#define HUMIDITY_TAG_PUB_NO_CHANGE_INTEVAL (1 * MINUT)
 #define HUMIDITY_TAG_PUB_VALUE_CHANGE 5.0f
 
-#define LUX_METER_TAG_PUB_NO_CHANGE_INTEVAL (15 * 60 * 1000)
+#define LUX_METER_TAG_PUB_NO_CHANGE_INTEVAL (15 * MINUT)
 #define LUX_METER_TAG_PUB_VALUE_CHANGE 25.0f
 
-#define BAROMETER_TAG_PUB_NO_CHANGE_INTEVAL (15 * 60 * 1000)
+#define BAROMETER_TAG_PUB_NO_CHANGE_INTEVAL (15 * MINUT)
 #define BAROMETER_TAG_PUB_VALUE_CHANGE 20.0f
 
-#define TEMPERATURE_DS18B20_PUB_NO_CHANGE_INTEVAL (5 * 60 * 1000)
+#define TEMPERATURE_DS18B20_PUB_NO_CHANGE_INTEVAL (1 * MINUT)
 #define TEMPERATURE_DS18B20_PUB_VALUE_CHANGE 0.2f
 
 struct {
@@ -346,6 +466,59 @@ void twr_radio_node_on_led_strip_thermometer_set(uint64_t *id, float *temperatur
     twr_scheduler_plan_now(led_strip.update_task_id);
 }
 
+static void thermostat_publish_set_point(void)
+{
+    twr_radio_pub_float("thermostat/-/set-point", &thermostat_set_point);
+}
+
+static void on_set_point_set(uint64_t *id, const char *topic, void *value, void *param)
+{
+    (void) id; (void) topic; (void) param;
+    float v = *(float *) value;
+    thermostat_set_point_save(v);
+    thermostat_publish_set_point();
+}
+
+static void on_set_point_get(uint64_t *id, const char *topic, void *value, void *param)
+{
+    (void) id; (void) topic; (void) value; (void) param;
+    thermostat_publish_set_point();
+}
+
+// --- Ventilátor garáže: dálkové nastavení prahu + dotaz na stav ---
+static void vent_publish_set_point(void)
+{
+    twr_radio_pub_float("vent/-/set-point", &vent_set_point);
+}
+
+static void on_vent_set_point_set(uint64_t *id, const char *topic, void *value, void *param)
+{
+    (void) id; (void) topic; (void) param;
+    float v = *(float *) value;
+    vent_set_point_save(v);
+    vent_publish_set_point();
+}
+
+static void on_vent_set_point_get(uint64_t *id, const char *topic, void *value, void *param)
+{
+    (void) id; (void) topic; (void) value; (void) param;
+    vent_publish_set_point();
+}
+
+static void on_vent_state_get(uint64_t *id, const char *topic, void *value, void *param)
+{
+    (void) id; (void) topic; (void) value; (void) param;
+    twr_radio_pub_bool("vent/-/state", &vent_on);
+}
+
+static twr_radio_sub_t subs[] = {
+    { "thermostat/-/set-point/set", TWR_RADIO_SUB_PT_FLOAT, on_set_point_set, NULL },
+    { "thermostat/-/set-point/get", TWR_RADIO_SUB_PT_NULL,  on_set_point_get, NULL },
+    { "vent/-/set-point/set",       TWR_RADIO_SUB_PT_FLOAT, on_vent_set_point_set, NULL },
+    { "vent/-/set-point/get",       TWR_RADIO_SUB_PT_NULL,  on_vent_set_point_get, NULL },
+    { "vent/-/state/get",           TWR_RADIO_SUB_PT_NULL,  on_vent_state_get, NULL },
+};
+
 void climate_module_event_handler(twr_module_climate_event_t event, void *event_param)
 {
     (void) event_param;
@@ -362,7 +535,7 @@ void climate_module_event_handler(twr_module_climate_event_t event, void *event_
                 params.temperature.value = value;
                 params.temperature.next_pub = twr_scheduler_get_spin_tick() + TEMPERATURE_TAG_PUB_NO_CHANGE_INTEVAL;
             }
-            bool new_heating = value < THERMOSTAT_SET_POINT;
+            bool new_heating = value < thermostat_set_point;
             if (new_heating != heating) 
             {
                 twr_module_power_relay_set_state(new_heating);
@@ -441,6 +614,13 @@ void ds18b20_event_handler(twr_ds18b20_t *self, uint64_t device_address, twr_ds1
             params.temperature_ds18b20.value = value;
             params.temperature_ds18b20.next_pub = twr_scheduler_get_spin_tick() + TEMPERATURE_DS18B20_PUB_NO_CHANGE_INTEVAL;
         }
+
+        // Lokální řízení ventilátoru garáže – jen z externího čidla v garáži.
+        // Vyhodnocuje se z každého měření (interval ~10 s), ne jen při publishi.
+        if (device_address == VENT_SENSOR_ADDRESS)
+        {
+            vent_control(value);
+        }
     }
 
     twr_scheduler_plan_now(0);
@@ -455,6 +635,10 @@ void application_init(void)
     twr_led_set_mode(&led, TWR_LED_MODE_OFF);
 
     twr_radio_init(TWR_RADIO_MODE_NODE_LISTENING);
+    twr_radio_set_subs(subs, sizeof(subs) / sizeof(subs[0]));
+
+    thermostat_set_point_load();
+    vent_set_point_load();
 
     // Initialize button
     twr_button_init(&button, TWR_GPIO_BUTTON, TWR_GPIO_PULL_DOWN, false);
@@ -481,6 +665,13 @@ void application_init(void)
     twr_ds18b20_set_event_handler(&ds18b20, ds18b20_event_handler, NULL);
     twr_ds18b20_set_update_interval(&ds18b20, TEMPERATURE_UPDATE_INTERVAL);
 
+    // Ventilátor garáže – relé na P7 (Sensor Module kanál C). Start vždy OFF.
+    // POZOR: musí být AŽ po twr_ds18b20_init_single (uvnitř twr_module_sensor_init,
+    // který reinicializuje kanály A/B/C). Jinak by se P7 přenastavila zpět na vstup.
+    twr_gpio_init(VENT_RELAY_GPIO);
+    twr_gpio_set_output(VENT_RELAY_GPIO, VENT_RELAY_OFF_LEVEL);
+    twr_gpio_set_mode(VENT_RELAY_GPIO, TWR_GPIO_MODE_OUTPUT);
+
     // Initialize power module
     twr_module_power_init();
 
@@ -491,6 +682,10 @@ void application_init(void)
 
     twr_radio_pairing_request("vyz-fve-battery-monitor", VYZ_VERSION);
 
+    thermostat_publish_set_point();
+    vent_publish_set_point();
+
     twr_led_pulse(&led, 2000);
-    twr_log_debug("Konec init");
+    twr_log_debug("Konec init: topeni set-point = %.1f C, vent set-point = %.1f C",
+                  (double) thermostat_set_point, (double) vent_set_point);
 }
