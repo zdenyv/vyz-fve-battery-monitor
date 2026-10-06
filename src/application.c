@@ -1,7 +1,7 @@
 #include <application.h>
 #include <twr_eeprom.h>
 
-#define VYZ_VERSION "1.2"
+#define VYZ_VERSION "1.3"
 
 #define THERMOSTAT_SET_POINT_DEFAULT 10.0f
 #define THERMOSTAT_SET_POINT_MIN     2.0f
@@ -44,9 +44,61 @@ static void thermostat_set_point_save(float v)
 
 /*
  ============================================================================
+  4-RELÉ DESKA  (5V, active-LOW, open-drain výstupy jako ve vyz-bazen)
+ ----------------------------------------------------------------------------
+  - R1 = P12 ventilátor garáže, R2..R4 = P13..P15 rezerva (ovládání přes MQTT)
+  - Open-drain: pin jen stahuje IN k zemi, log. 1 drží pull-up desky na 5 V.
+  - P11 (TXD2) záměrně nepoužit – drží ho UART logu.
+ ============================================================================
+*/
+
+#define RELAY_BOARD_COUNT     4
+#define RELAY_BOARD_ON_LEVEL  0
+
+static const twr_gpio_channel_t relay_board_gpio[RELAY_BOARD_COUNT] = {
+    TWR_GPIO_P12, TWR_GPIO_P13, TWR_GPIO_P14, TWR_GPIO_P15
+};
+static bool relay_board_on[RELAY_BOARD_COUNT];
+static twr_scheduler_task_id_t relay_board_pulse_task_id[RELAY_BOARD_COUNT];
+
+static void relay_board_write(int i, bool on)
+{
+    twr_gpio_set_output(relay_board_gpio[i], on ? RELAY_BOARD_ON_LEVEL : !RELAY_BOARD_ON_LEVEL);
+    relay_board_on[i] = on;
+}
+
+// Topic relay/<1..4>/state – číslování podle svorek na desce.
+static void relay_board_publish(int i)
+{
+    char topic[24];
+    snprintf(topic, sizeof(topic), "relay/%d/state", i + 1);
+    twr_radio_pub_bool(topic, &relay_board_on[i]);
+}
+
+static void relay_board_pulse_end_task(void *param)
+{
+    int i = (int) (intptr_t) param;
+    relay_board_write(i, false);
+    relay_board_publish(i);
+}
+
+static void relay_board_init(void)
+{
+    for (int i = 0; i < RELAY_BOARD_COUNT; i++)
+    {
+        // Nejdřív úroveň OFF, pak teprve výstup – jinak relé při bootu cvakne.
+        twr_gpio_init(relay_board_gpio[i]);
+        relay_board_write(i, false);
+        twr_gpio_set_mode(relay_board_gpio[i], TWR_GPIO_MODE_OUTPUT_OD);
+        relay_board_pulse_task_id[i] = twr_scheduler_register(relay_board_pulse_end_task, (void *) (intptr_t) i, TWR_TICK_INFINITY);
+    }
+}
+
+/*
+ ============================================================================
   VENTILÁTOR GARÁŽE  (chlazení, nezávislé na termostatu topení baterie)
  ----------------------------------------------------------------------------
-  - Akční člen: 5V relé deska na Sensor Module kanál C = GPIO P7
+  - Akční člen: relé R1 na 4-relé desce (P12)
   - Teplota:    EXTERNÍ DS18B20 v garáži (ne onboard Climate Module!)
                 device 0x3200000ceb33a428, topic ext-thermometer/.../temperature
   - Logika:     CHLAZENÍ s hysterezí. ON při t >= práh, OFF při t <= práh - hyst.
@@ -57,12 +109,7 @@ static void thermostat_set_point_save(float v)
 // Cílové externí čidlo (garáž). Pojistka, kdyby přibyl další DS18B20.
 #define VENT_SENSOR_ADDRESS  0x3200000ceb33a428ULL
 
-// Relé deska na P7. Pokud je deska active-LOW (sepne logickou 0),
-// přepni VENT_RELAY_ACTIVE_HIGH na 0.
-#define VENT_RELAY_GPIO          TWR_GPIO_P7
-#define VENT_RELAY_ACTIVE_HIGH   1
-#define VENT_RELAY_ON_LEVEL      (VENT_RELAY_ACTIVE_HIGH ? 1 : 0)
-#define VENT_RELAY_OFF_LEVEL     (VENT_RELAY_ACTIVE_HIGH ? 0 : 1)
+#define VENT_RELAY_INDEX     0   // R1
 
 #define VENT_SET_POINT_DEFAULT   30.0f   // °C – ON nad tuto teplotu
 #define VENT_SET_POINT_MIN       20.0f
@@ -103,7 +150,7 @@ static void vent_relay_set(bool on)
 {
     if (on == vent_on) return;
 
-    twr_gpio_set_output(VENT_RELAY_GPIO, on ? VENT_RELAY_ON_LEVEL : VENT_RELAY_OFF_LEVEL);
+    relay_board_write(VENT_RELAY_INDEX, on);
     vent_on = on;
     twr_radio_pub_bool("vent/-/state", &vent_on);
     twr_log_debug("Ventilator garaz: %s (prah %.1f C)", on ? "ON" : "OFF", (double) vent_set_point);
@@ -224,6 +271,9 @@ static struct
 
 } led_strip = { .show = LED_STRIP_SHOW_COLOR, .color = 0 };
 
+// Barva parkovací signalizace (0 = neaktivní). Má přednost před MQTT barvou pásku.
+static uint32_t parking_color = 0;
+
 void button_event_handler(twr_button_t *self, twr_button_event_t event, void *event_param)
 {
     (void) self;
@@ -309,7 +359,11 @@ void led_strip_update_task(void *param)
 
 void led_strip_fill(void)
 {
-    if (led_strip.show == LED_STRIP_SHOW_COLOR)
+    if (parking_color != 0)
+    {
+        twr_led_strip_fill(&led_strip.self, parking_color);
+    }
+    else if (led_strip.show == LED_STRIP_SHOW_COLOR)
     {
         twr_led_strip_fill(&led_strip.self, led_strip.color);
     }
@@ -466,6 +520,198 @@ void twr_radio_node_on_led_strip_thermometer_set(uint64_t *id, float *temperatur
     twr_scheduler_plan_now(led_strip.update_task_id);
 }
 
+/*
+ ============================================================================
+  GARÁŽOVÁ VRATA – vstupy a parkovací signalizace na LED pásku
+ ----------------------------------------------------------------------------
+  - P4 (Sensor A): žárovka pohonu 32,5 V přes optočlen PC814 (OC k GND).
+                   Žárovka svítí = pin v 0. Funguje pro AC (pulzy 100 Hz) i DC.
+  - P7 (Sensor C): jazýčkový kontakt vrat k GND, sepnutý = vrata zavřená.
+                   Nezapojený kontakt (pull-up) = "otevřeno".
+  - P6:            fotobuňka v rovině vrat, kontakt NC/COM k GND,
+                   sepnutý = paprsek přerušený (nebo fotobuňka bez napájení).
+  - Pásek:  přerušení paprsku delší než PARKING_CAR_MIN_TIME = auto ve vratech
+            → ČERVENÁ; paprsek se pak uvolní → ZELENÁ (lze zavřít) na
+            PARKING_CLEAR_TIME; zavření vrat → zhasnout.
+ ============================================================================
+*/
+
+#define LAMP_GPIO               TWR_GPIO_P4
+#define LAMP_SAMPLE_INTERVAL    10                // ms – zachytí i AC pulzy
+#define LAMP_OFF_DELAY          (1500)            // ms bez signálu = zhasnuto (přemostí i blikání)
+
+#define DOOR_GPIO               TWR_GPIO_P7
+#define DOOR_DEBOUNCE_TIME      200
+
+#define BEAM_GPIO               TWR_GPIO_P6
+#define BEAM_DEBOUNCE_TIME      50
+
+#define PARKING_CAR_MIN_TIME    (1 * SEKUND)      // kratší přerušení (člověk, pes) se ignoruje
+#define PARKING_CLEAR_TIME      (30 * SEKUND)
+
+// Barvy 0xRRGGBBWW, ~25 % jasu kvůli odběru celého pásku
+#define PARKING_COLOR_CAR       0x40000000
+#define PARKING_COLOR_CLEAR     0x00400000
+
+static twr_button_t door_input;
+static twr_button_t beam_input;
+static bool door_open = false;  // = výchozí stav twr_button; otevřená vrata hlásí PRESS hned po startu
+static bool lamp_on = false;
+static twr_tick_t lamp_last_active = 0;
+
+static enum
+{
+    PARKING_IDLE = 0,
+    PARKING_CAR = 1,
+    PARKING_CLEAR = 2
+
+} parking_state = PARKING_IDLE;
+
+static twr_scheduler_task_id_t parking_timeout_task_id;
+
+static const char *parking_state_name(void)
+{
+    switch (parking_state)
+    {
+        case PARKING_CAR:   return "car";
+        case PARKING_CLEAR: return "clear";
+        case PARKING_IDLE:
+        default:            return "idle";
+    }
+}
+
+static void parking_set_state(int state)
+{
+    if ((int) parking_state == state) return;
+
+    parking_state = state;
+
+    if (state == PARKING_CAR)
+    {
+        parking_color = PARKING_COLOR_CAR;
+    }
+    else if (state == PARKING_CLEAR)
+    {
+        parking_color = PARKING_COLOR_CLEAR;
+    }
+    else
+    {
+        parking_color = 0;
+    }
+
+    if (parking_color != 0)
+    {
+        // Efekt by parkovací barvu přepisoval vlastním taskem
+        twr_led_strip_effect_stop(&led_strip.self);
+
+        if (led_strip.show == LED_STRIP_SHOW_EFFECT)
+        {
+            led_strip.show = LED_STRIP_SHOW_COLOR;
+            led_strip.color = 0;
+        }
+    }
+
+    twr_scheduler_plan_absolute(parking_timeout_task_id, state == PARKING_CLEAR ? twr_tick_get() + PARKING_CLEAR_TIME : TWR_TICK_INFINITY);
+
+    led_strip_fill();
+    twr_scheduler_plan_now(led_strip.update_task_id);
+
+    twr_radio_pub_string("parking/-/state", parking_state_name());
+    twr_log_debug("Parkovani: %s", parking_state_name());
+}
+
+static void parking_timeout_task(void *param)
+{
+    (void) param;
+    parking_set_state(PARKING_IDLE);
+}
+
+static void door_input_event_handler(twr_button_t *self, twr_button_event_t event, void *event_param)
+{
+    (void) self; (void) event_param;
+
+    if (event == TWR_BUTTON_EVENT_PRESS || event == TWR_BUTTON_EVENT_RELEASE)
+    {
+        door_open = event == TWR_BUTTON_EVENT_PRESS;
+        twr_radio_pub_bool("door/-/open", &door_open);
+
+        if (!door_open)
+        {
+            parking_set_state(PARKING_IDLE);
+        }
+    }
+}
+
+static void beam_input_event_handler(twr_button_t *self, twr_button_event_t event, void *event_param)
+{
+    (void) self; (void) event_param;
+
+    if (event == TWR_BUTTON_EVENT_PRESS || event == TWR_BUTTON_EVENT_RELEASE)
+    {
+        bool blocked = event == TWR_BUTTON_EVENT_PRESS;
+        twr_radio_pub_bool("door-beam/-/blocked", &blocked);
+
+        if (!blocked && parking_state == PARKING_CAR)
+        {
+            parking_set_state(PARKING_CLEAR);
+        }
+    }
+    else if (event == TWR_BUTTON_EVENT_HOLD)
+    {
+        // Paprsek přerušený déle než PARKING_CAR_MIN_TIME
+        if (door_open)
+        {
+            parking_set_state(PARKING_CAR);
+        }
+    }
+}
+
+// Žárovka: při AC je výstup optočlenu pulzní, proto "svítí" = byl aktivní
+// v posledních LAMP_OFF_DELAY ms, ne okamžitá úroveň pinu.
+static void lamp_task(void *param)
+{
+    (void) param;
+
+    twr_tick_t now = twr_tick_get();
+
+    if (twr_gpio_get_input(LAMP_GPIO) == 0)
+    {
+        lamp_last_active = now;
+    }
+
+    bool on = lamp_last_active != 0 && (now - lamp_last_active) < LAMP_OFF_DELAY;
+
+    if (on != lamp_on)
+    {
+        lamp_on = on;
+        twr_radio_pub_bool("door-light/-/state", &lamp_on);
+    }
+
+    twr_scheduler_plan_current_relative(LAMP_SAMPLE_INTERVAL);
+}
+
+// Volat AŽ po twr_ds18b20_init_* – twr_module_sensor_init reinicializuje P4/P5/P7.
+static void garage_inputs_init(void)
+{
+    twr_gpio_init(LAMP_GPIO);
+    twr_gpio_set_mode(LAMP_GPIO, TWR_GPIO_MODE_INPUT);
+    twr_gpio_set_pull(LAMP_GPIO, TWR_GPIO_PULL_UP);
+    twr_scheduler_register(lamp_task, NULL, 0);
+
+    // "stisk" = vrata otevřená (pin 1 přes pull-up, kontakt rozepnutý)
+    twr_button_init(&door_input, DOOR_GPIO, TWR_GPIO_PULL_UP, 0);
+    twr_button_set_debounce_time(&door_input, DOOR_DEBOUNCE_TIME);
+    twr_button_set_event_handler(&door_input, door_input_event_handler, NULL);
+
+    // "stisk" = paprsek přerušený (kontakt NC sepnutý k GND)
+    twr_button_init(&beam_input, BEAM_GPIO, TWR_GPIO_PULL_UP, 1);
+    twr_button_set_debounce_time(&beam_input, BEAM_DEBOUNCE_TIME);
+    twr_button_set_hold_time(&beam_input, PARKING_CAR_MIN_TIME);
+    twr_button_set_event_handler(&beam_input, beam_input_event_handler, NULL);
+
+    parking_timeout_task_id = twr_scheduler_register(parking_timeout_task, NULL, TWR_TICK_INFINITY);
+}
+
 static void thermostat_publish_set_point(void)
 {
     twr_radio_pub_float("thermostat/-/set-point", &thermostat_set_point);
@@ -511,7 +757,52 @@ static void on_vent_state_get(uint64_t *id, const char *topic, void *value, void
     twr_radio_pub_bool("vent/-/state", &vent_on);
 }
 
+// --- Rezervní relé R2..R4: param = index relé (0-based) ---
+static void on_relay_set(uint64_t *id, const char *topic, void *value, void *param)
+{
+    (void) id; (void) topic;
+    int i = (int) (intptr_t) param;
+    twr_scheduler_plan_absolute(relay_board_pulse_task_id[i], TWR_TICK_INFINITY);  // zruší běžící pulz
+    relay_board_write(i, *(bool *) value);
+    relay_board_publish(i);
+}
+
+static void on_relay_pulse(uint64_t *id, const char *topic, void *value, void *param)
+{
+    (void) id; (void) topic;
+    int i = (int) (intptr_t) param;
+    int duration = *(int *) value;
+    if (duration <= 0) return;
+    relay_board_write(i, true);
+    relay_board_publish(i);
+    twr_scheduler_plan_from_now(relay_board_pulse_task_id[i], duration);
+}
+
+static void on_relay_get(uint64_t *id, const char *topic, void *value, void *param)
+{
+    (void) id; (void) topic; (void) value;
+    relay_board_publish((int) (intptr_t) param);
+}
+
+static void on_parking_get(uint64_t *id, const char *topic, void *value, void *param)
+{
+    (void) id; (void) topic; (void) value; (void) param;
+    twr_radio_pub_string("parking/-/state", parking_state_name());
+    twr_radio_pub_bool("door/-/open", &door_open);
+    twr_radio_pub_bool("door-light/-/state", &lamp_on);
+}
+
 static twr_radio_sub_t subs[] = {
+    { "relay/2/state/set", TWR_RADIO_SUB_PT_BOOL, on_relay_set,   (void *) 1 },
+    { "relay/3/state/set", TWR_RADIO_SUB_PT_BOOL, on_relay_set,   (void *) 2 },
+    { "relay/4/state/set", TWR_RADIO_SUB_PT_BOOL, on_relay_set,   (void *) 3 },
+    { "relay/2/pulse/set", TWR_RADIO_SUB_PT_INT,  on_relay_pulse, (void *) 1 },
+    { "relay/3/pulse/set", TWR_RADIO_SUB_PT_INT,  on_relay_pulse, (void *) 2 },
+    { "relay/4/pulse/set", TWR_RADIO_SUB_PT_INT,  on_relay_pulse, (void *) 3 },
+    { "relay/2/state/get", TWR_RADIO_SUB_PT_NULL, on_relay_get,   (void *) 1 },
+    { "relay/3/state/get", TWR_RADIO_SUB_PT_NULL, on_relay_get,   (void *) 2 },
+    { "relay/4/state/get", TWR_RADIO_SUB_PT_NULL, on_relay_get,   (void *) 3 },
+    { "parking/-/state/get", TWR_RADIO_SUB_PT_NULL, on_parking_get, NULL },
     { "thermostat/-/set-point/set", TWR_RADIO_SUB_PT_FLOAT, on_set_point_set, NULL },
     { "thermostat/-/set-point/get", TWR_RADIO_SUB_PT_NULL,  on_set_point_get, NULL },
     { "vent/-/set-point/set",       TWR_RADIO_SUB_PT_FLOAT, on_vent_set_point_set, NULL },
@@ -628,6 +919,9 @@ void ds18b20_event_handler(twr_ds18b20_t *self, uint64_t device_address, twr_ds1
 
 void application_init(void)
 {
+    // Relé deska co nejdřív – do té doby drží OFF jen pull-up desky.
+    relay_board_init();
+
     twr_log_init(TWR_LOG_LEVEL_DUMP, TWR_LOG_TIMESTAMP_ABS);
 
     // Initialize LED
@@ -665,12 +959,10 @@ void application_init(void)
     twr_ds18b20_set_event_handler(&ds18b20, ds18b20_event_handler, NULL);
     twr_ds18b20_set_update_interval(&ds18b20, TEMPERATURE_UPDATE_INTERVAL);
 
-    // Ventilátor garáže – relé na P7 (Sensor Module kanál C). Start vždy OFF.
+    // Vstupy garáže (žárovka P4, vrata P7, fotobuňka P6).
     // POZOR: musí být AŽ po twr_ds18b20_init_single (uvnitř twr_module_sensor_init,
-    // který reinicializuje kanály A/B/C). Jinak by se P7 přenastavila zpět na vstup.
-    twr_gpio_init(VENT_RELAY_GPIO);
-    twr_gpio_set_output(VENT_RELAY_GPIO, VENT_RELAY_OFF_LEVEL);
-    twr_gpio_set_mode(VENT_RELAY_GPIO, TWR_GPIO_MODE_OUTPUT);
+    // který reinicializuje kanály A/B/C). Jinak by se P4/P7 přenastavily.
+    garage_inputs_init();
 
     // Initialize power module
     twr_module_power_init();
